@@ -19,99 +19,85 @@ except Exception as e:
 
 # --- Import LangChain Components ---
 try:
+    from langchain.agents import AgentExecutor, create_tool_calling_agent
     from langchain_core.prompts import ChatPromptTemplate
-    from langchain_core.output_parsers import StrOutputParser
+    from langchain_core.messages import BaseMessage, HumanMessage
+    from langchain_core.tools import BaseTool
 except ImportError as e:
-    print(f"FATAL ERROR: Could not import LangChain core components: {e}")
-    print("Please ensure LangChain is installed correctly (e.g., pip install langchain-core).")
+    print(f"FATAL ERROR: Could not import LangChain components: {e}")
+    print("Please ensure LangChain is installed correctly (e.g., pip install langchain-core langchain-community langchain).")
     sys.exit(1)
 
 # --- Import Configurations and Utilities ---
 try:
     from config import settings  # For API key loading logic
     from utils import input_helpers  # For get_multiline_input
-    # We might not need specific task prompts from 'prompts' module anymore,
-    # but keeping it for now in case settings.TASKS is referenced indirectly.
+    from prompts.agent_prompts import AGENT_PROMPT_TEMPLATE
 except ImportError as e:
     print(f"FATAL ERROR: Could not import necessary modules (settings or utils): {e}")
-    print("Ensure 'config/settings.py' and 'utils/input_helpers.py' exist with their __init__.py files.")
+    print("Ensure 'config/settings.py', 'utils/input_helpers.py', and 'prompts/agent_prompts.py' exist with their __init__.py files.")
     sys.exit(1)
 
-# --- New Prompt for Q&A Summarization ---
-QA_SUMMARY_PROMPT_TEMPLATE = """
-You are a helpful research assistant.
-Please answer the following question based on your knowledge.
-Provide only a concise summary of your answer. Do not include your thinking process, intermediate steps, or any conversational fluff.
 
-Question:
-{user_question}
+# --- Helper Functions ---
+def _display_model_menu(model_keys: list):
+    """Prints a formatted menu of available models, grouped by provider."""
+    current_provider_group = None
+    for i, key in enumerate(model_keys):
+        provider_name = key.split('/')[0]
+        if provider_name != current_provider_group:
+            if current_provider_group is not None:
+                print("---")
+            current_provider_group = provider_name
+            print(f"--- {provider_name.upper()} ---")
+        print(f"{i + 1}. {key}")
 
-Concise Summary of Answer:
-"""
+
+# --- Custom DuckDuckGo Search Tool ---
+class DuckDuckGoSearchResults(BaseTool):
+    """Custom tool for DuckDuckGo search using the ddgs package."""
+    
+    name: str = "duckduckgo_results_json"
+    description: str = "A tool that searches DuckDuckGo for results and returns them as a JSON array."
+    
+    def _run(self, query: str) -> str:
+        """Execute the search and return results."""
+        try:
+            # The `ddg` function from older versions of `duckduckgo-search` is deprecated.
+            # We now use the synchronous `DDGS` class.
+            from ddgs.ddgs_sync import DDGS
+
+            with DDGS() as ddgs:
+                results = ddgs.text(query, max_results=10)
+
+            # Format results as JSON string
+            import json
+            return json.dumps(results) if results else "[]"
+        except Exception as e:
+            return f"Error performing search: {str(e)}"
 
 
-# --- Model Initialization Wrapper (largely unchanged) ---
+# --- Model Initialization Wrapper ---
 def initialize_all_ai_models():
     """
     Initializes AI models by calling the main initializer function from model_loader.py.
+    This function now passes configuration directly, decoupling the loader.
     """
-    print("Attempting to initialize AI models via models/model_loader.py...")
-    initialized_models_dict = {}
-    initialization_errors_dict = {}
+    print("\n--- Initializing Models ---")
 
     try:
-        if hasattr(model_loader, 'initialize_models'):
-            initialized_models_dict, initialization_errors_dict = model_loader.initialize_models()
-        else:
-            error_msg = "ERROR: 'models/model_loader.py' does not have a recognized model initialization function (e.g., 'initialize_models')."
-            print(error_msg)
-            initialization_errors_dict["model_loader.py_interface"] = error_msg
-            return {}, initialization_errors_dict
-
-        if not initialized_models_dict and not initialization_errors_dict:
-            print("Warning: model_loader.py's initialization function returned no models and no errors. "
-                  "Check model_loader.py implementation and API key availability in .env (loaded by config/settings.py).")
-            initialization_errors_dict[
-                "model_loader_empty_return"] = "No models or specific errors returned from model_loader.py."
-        elif not initialized_models_dict:
-            print("No models were successfully initialized by model_loader.py.")
-
-    except AttributeError as e:
-        error_msg = f"ERROR: 'models/model_loader.py' seems to be missing an expected attribute or function: {e}"
-        print(error_msg)
-        initialization_errors_dict["model_loader.py_interface_attr"] = error_msg
+        # Pass configuration directly to the decoupled model loader
+        initialized_models, init_errors = model_loader.initialize_models(
+            api_keys=settings.API_KEYS,
+            api_key_arg_names=settings.API_KEY_ARG_NAMES
+        )
+        print("--- Model Initialization Complete ---")
+        return initialized_models, init_errors
     except Exception as e:
-        error_msg = f"An unexpected error occurred while trying to load models from model_loader.py: {str(e)}"
+        error_msg = f"An unexpected error occurred while trying to load models: {str(e)}"
         print(error_msg)
         traceback.print_exc()
-        initialization_errors_dict["model_loader.py_execution"] = error_msg
-
-    return initialized_models_dict, initialization_errors_dict
-
-
-# --- Model Execution for Q&A ---
-def get_summarized_answer(model_key, question, models_dict):
-    """
-    Gets a summarized answer from the selected model for the given question.
-    """
-    print(f"\nAsking model '{model_key}' for a summarized answer...")
-    model_instance = models_dict.get(model_key)
-
-    if not model_instance:
-        return f"Error: Model '{model_key}' not found in initialized models."
-
-    try:
-        output_parser = StrOutputParser()
-        prompt_template = ChatPromptTemplate.from_template(QA_SUMMARY_PROMPT_TEMPLATE)
-        chain = prompt_template | model_instance | output_parser
-
-        result = chain.invoke({"user_question": question})
-        return result
-
-    except Exception as e:
-        print(f"ERROR during model execution for {model_key}:")
-        traceback.print_exc()
-        return f"Error getting answer from model {model_key}: {e}"
+        return {}, {"model_loader.py_execution": error_msg}
 
 
 # --- Main Application Loop for Research Q&A ---
@@ -131,20 +117,25 @@ def run_research_qa_loop():
             print("No specific errors were reported, but initialization failed.")
         sys.exit(1)
 
+    # --- Initialize Tools ---
+    # This is done once, as the tool is independent of the model.
+    search_tool = DuckDuckGoSearchResults(name="duckduckgo_results_json")
+    tools = [search_tool]
+    print("\n--- Tools Initialized ---")
+    print("✅ DuckDuckGo Search is ready.")
+
+    # --- Create Agent Prompt Template from imported string ---
+    agent_prompt = ChatPromptTemplate.from_messages([
+        ("system", AGENT_PROMPT_TEMPLATE),
+        ("placeholder", "{chat_history}"),
+        ("human", "{input}"),
+        ("placeholder", "{agent_scratchpad}"),
+    ])
+
     available_model_keys = sorted(list(initialized_models.keys()))
 
     print(f"\n--- Successfully Initialized Models ({len(available_model_keys)} available) ---")
-    # This initial printing of models can be refactored into a helper if used multiple times
-    current_provider_group_init = None
-    model_display_number_init = 1
-    for key_init in available_model_keys:
-        provider_name_init = key_init.split('/')[0]
-        if provider_name_init != current_provider_group_init:
-            if current_provider_group_init is not None:
-                print("---")
-            current_provider_group_init = provider_name_init
-        print(f"{model_display_number_init}. {key_init}")
-        model_display_number_init += 1
+    _display_model_menu(available_model_keys)
 
     if init_errors:
         print("\n--- Initialization Warnings ---")
@@ -160,16 +151,7 @@ def run_research_qa_loop():
         while True:  # Model selection inner loop
             print("\n----------------------------------------")
             print("Select a model for your research questions:")
-            current_provider_group_select = None
-            model_select_number = 1
-            for key_option in available_model_keys:
-                provider_name_select = key_option.split('/')[0]
-                if provider_name_select != current_provider_group_select:
-                    if current_provider_group_select is not None:
-                        print("---")
-                    current_provider_group_select = provider_name_select
-                print(f"{model_select_number}. {key_option}")
-                model_select_number += 1
+            _display_model_menu(available_model_keys)
             print("0. Exit Program")
 
             choice = input("Enter model choice number: ").strip()
@@ -187,8 +169,18 @@ def run_research_qa_loop():
             except ValueError:
                 print("Invalid input. Please enter a number.")
 
-        # Q&A Loop with the selected model
-        if selected_key:  # Proceed only if a model was selected
+        # Agent Session Loop with the selected model
+        if selected_key:
+            # --- Create Agent and Executor for the selected model ---
+            llm = initialized_models[selected_key]
+            agent = create_tool_calling_agent(llm, tools, agent_prompt)
+            agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+            print(f"Agent created for model: {selected_key}. Ready for questions.")
+
+            # --- Initialize Chat History for the new session ---
+            chat_history: list[BaseMessage] = []
+
+            # Q&A session loop for the current model
             while True:  # Q&A session loop for the current model
                 print("\n----------------------------------------")
                 # Simplified question prompt
@@ -199,39 +191,54 @@ def run_research_qa_loop():
                     print("Question cannot be empty.")
                     continue
 
-                print(f"\nProcessing your question with {selected_key}...")
-                summary_answer = get_summarized_answer(selected_key, question, initialized_models)
+                print(f"\nProcessing your question with agent ({selected_key})...")
+                try:
+                    response = agent_executor.invoke({
+                        "input": question,
+                        "chat_history": chat_history
+                    })
+                    summary_answer = response.get("output", "Agent did not return an answer.")
+                    # Add interaction to history for conversational context
+                    chat_history.extend([HumanMessage(content=question), response["output"]])
+                except Exception as e:
+                    summary_answer = f"An error occurred while running the agent: {e}"
 
-                print(f"\n--- Summarized Answer from {selected_key} ---")
+                print(f"\n--- Answer from {selected_key} ---")
                 print(summary_answer)
                 print("----------------------------------------")
 
                 # Post-answer menu
                 action_prompt = (
                     "Options:\n"
-                    "1. Ask another question (to this model)\n"
-                    "2. Change model\n"
-                    "3. Exit program\n"
-                    "Enter choice (1/2/3): "
+                    "1. Ask a follow-up (continue this conversation)\n"
+                    "2. Start a new topic (clears conversation history)\n"
+                    "3. Change model\n"
+                    "4. Exit program\n"
+                    "Enter choice (1/2/3/4): "
                 )
                 user_action_valid = False
                 while not user_action_valid:  # Loop for valid action choice
                     user_action = input(action_prompt).strip()
-                    if user_action == '1':  # Ask another question
+                    if user_action == '1':  # Ask a follow-up
                         user_action_valid = True
                         # No break needed here, outer Q&A loop will continue
-                    elif user_action == '2':  # Change model
+                    elif user_action == '2':  # Start a new topic
+                        print("\nClearing conversation history for a new topic.")
+                        chat_history.clear()
+                        user_action_valid = True
+                        # No break needed, loop will continue with empty history
+                    elif user_action == '3':  # Change model
                         print(f"Ending session with {selected_key}.")
                         user_action_valid = True
                         # This break will exit the Q&A session loop,
                         # and the outer model selection loop will restart.
-                    elif user_action == '3':  # Exit program
+                    elif user_action == '4':  # Exit program
                         print("Exiting program.")
                         sys.exit(0)
                     else:
-                        print("Invalid choice. Please enter 1, 2, or 3.")
+                        print("Invalid choice. Please enter 1, 2, 3, or 4.")
 
-                if user_action == '2':  # If "Change model" was chosen
+                if user_action == '3':  # If "Change model" was chosen
                     break  # Break from the Q&A session loop to go back to model selection
         else:
             # This case should ideally not be reached if model selection logic is sound
